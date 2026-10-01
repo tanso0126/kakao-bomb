@@ -2,6 +2,7 @@
 // 채팅창이 앞에 오면 창 옆에 트레이가 자동으로 뜸. 💣 자폭(또는 Ctrl+Alt+D)으로 장전/해제 토글
 // → 해제할 때까지 그 채팅창에서 보내는 내 메시지마다 설정한 시간(기본 0.5초) 뒤 "모두에게서 삭제".
 // 빌드: powershell -ExecutionPolicy Bypass -File build.ps1
+// 🖼(또는 Ctrl+Alt+Enter): 입력창의 글을 이미지로 바꿔 보내고 삭제. 붙여넣은 사진도 삭제.
 // 실행: kakao-bomb.exe          (--debug: 삭제 과정을 %LOCALAPPDATA%\kakao-bomb\debug.log 에 기록)
 //       kakao-bomb.exe --dump   (삭제 없이 카톡 창 구조만 dump.txt 로 저장)
 //
@@ -165,6 +166,54 @@ static class N
         PostMessage(h, right ? 0x0205u : 0x0202u, IntPtr.Zero, l);               // WM_?BUTTONUP
     }
 
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] static extern bool GetKeyboardState(byte[] s);
+    [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] s);
+
+    /// Ctrl+키 를 그 창에만 보냄. 카톡은 Ctrl 여부를 자기 스레드의 키 상태로 판단하므로
+    /// 입력 큐에 잠깐 붙어서 Ctrl만 눌린 상태로 만들어 두고 키 메시지를 보낸 뒤 되돌림. 실제 키보드는 안 건드림.
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+
+    public static void CtrlKey(IntPtr h, int vk)
+    {
+        // 그 창이 지금 맨 앞이면 키 상태를 속일 수 없음 (실제 키보드 상태로 덮어써짐) → 진짜 키 입력으로
+        if (GetForegroundWindow() == h || IsChild(GetForegroundWindow(), h))
+        {
+            keybd_event(0x11, 0, 0, UIntPtr.Zero);
+            keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+            keybd_event((byte)vk, 0, 2, UIntPtr.Zero);
+            keybd_event(0x11, 0, 2, UIntPtr.Zero);
+            return;
+        }
+        uint pid, target = GetWindowThreadProcessId(h, out pid), me = GetCurrentThreadId();
+        if (!AttachThreadInput(me, target, true)) return;
+        try
+        {
+            var saved = new byte[256];
+            GetKeyboardState(saved);
+            var down = (byte[])saved.Clone();
+            foreach (int k in new[] { 0x10, 0x12, 0xA0, 0xA1, 0xA4, 0xA5, 0x5B, 0x5C }) down[k] = 0;  // Shift/Alt/Win 은 뗀 상태로
+            down[0x11] = 0x80;
+            SetKeyboardState(down);
+            PostMessage(h, 0x0100, (IntPtr)vk, (IntPtr)1);
+            Thread.Sleep(120);
+            PostMessage(h, 0x0101, (IntPtr)vk, (IntPtr)unchecked((int)0xC0000001));
+            Thread.Sleep(30);
+            SetKeyboardState(saved);
+        }
+        finally { AttachThreadInput(me, target, false); }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, string l, uint flags, uint ms, out IntPtr res);
+
+    public static void SetText(IntPtr h, string text)
+    {
+        IntPtr res;
+        SendMessageTimeout(h, 0x0C, IntPtr.Zero, text, 2, 300, out res);
+    }
+
     public static void Key(IntPtr h, int vk)
     {
         PostMessage(h, 0x0100, (IntPtr)vk, (IntPtr)1);
@@ -229,32 +278,61 @@ sealed class Chat
     }
 }
 
-/// 장전된 채팅창 하나. 입력창에 글이 있다가 Enter/클릭 직후 비워지면 "보냄"으로 보고 그 글을 돌려줌.
+/// 장전된 채팅창 하나. 전송 감지는 두 가지:
+///  - 글: 입력창에 글이 있다가 Enter/클릭 직후 비워지면 "보냄" (Poll)
+///  - 붙여넣은 사진: "클립보드 이미지 전송" 창이 Enter/전송 클릭으로 닫히면 "보냄" (Dialog)
+/// 어느 쪽이든 삭제는 "보내기 전 목록 모양"(Before)과 달라지고 맨 아래가 내 말풍선이 된 뒤에 시작.
 sealed class Armed
 {
     public readonly Chat Chat;
+    public IntPtr Dialog;             // 떠 있는 이미지 전송 창
+    public Rectangle DialogRect;
+    readonly object gate = new object();
+    readonly List<KeyValuePair<long, Profile>> history = new List<KeyValuePair<long, Profile>>();
+
+    public void Remember(long now, Profile p)
+    {
+        lock (gate)
+        {
+            history.Add(new KeyValuePair<long, Profile>(now, p));
+            if (history.Count > 12) history.RemoveAt(0);
+        }
+    }
+
+    /// 조금 전(ms 이상 전)의 목록 모양 = 방금 보낸 메시지가 아직 없던 때
+    public Profile Before(long now, int ms)
+    {
+        lock (gate)
+        {
+            for (int i = history.Count - 1; i >= 0; i--) if (now - history[i].Key >= ms) return history[i].Value;
+            return history.Count > 0 ? history[0].Value : null;
+        }
+    }
     string prev;
     string lastText = "";
 
     public Armed(Chat chat)
     {
         Chat = chat;
-        prev = Read() ?? "";
+        prev = Read(chat) ?? "";
         lastText = prev;
     }
 
     /// 입력창 내용. 비어 있을 때 카톡이 넣어 두는 안내 문구("메시지 입력")는 빈 것으로 침. 읽기 실패는 null.
-    string Read()
+    public static string Read(Chat chat)
     {
-        int len = N.TextLength(Chat.Edit);
+        int len = N.TextLength(chat.Edit);
         if (len < 0) return null;
-        string s = len == 0 ? "" : N.Text(Chat.Edit, len);
+        string s = len == 0 ? "" : N.Text(chat.Edit, len);
         return Array.IndexOf(Config.Placeholders, s.Trim()) >= 0 ? "" : s;
     }
 
+    /// 우리가 입력창을 비웠을 때 (전송으로 오인하지 않게)
+    public void ResetInput() { prev = ""; }
+
     public string Poll(bool sendKey, long enterAge, long clickAge)
     {
-        string cur = Read();
+        string cur = Read(Chat);
         if (cur == null) return null;
         if (Log.On && cur.Length != prev.Length)
             Log.Write("입력창 " + prev.Length + "→" + cur.Length + " (Enter " + enterAge + "ms 전, 클릭 " + clickAge + "ms 전)");
@@ -263,6 +341,55 @@ sealed class Armed
         if (cur.Length > 0) lastText = cur;
         return sent ? lastText : null;
     }
+}
+
+/// 창 그림을 빠르게 읽기 위한 픽셀 배열
+sealed class Snap
+{
+    public readonly int W, H;
+    readonly int[] px;
+
+    public Snap(Bitmap bmp)
+    {
+        W = bmp.Width; H = bmp.Height;
+        px = new int[W * H];
+        var d = bmp.LockBits(new Rectangle(0, 0, W, H), System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try { Marshal.Copy(d.Scan0, px, 0, W * H); } finally { bmp.UnlockBits(d); }
+    }
+
+    public static Snap Of(IntPtr h) { using (var bmp = N.Capture(h)) return new Snap(bmp); }
+    public int At(int x, int y) { return px[y * W + x]; }
+
+    public static int Diff(int a, int b)
+    {
+        return Math.Abs(((a >> 16) & 255) - ((b >> 16) & 255)) + Math.Abs(((a >> 8) & 255) - ((b >> 8) & 255)) + Math.Abs((a & 255) - (b & 255));
+    }
+
+    /// 배경색 = 그 세로줄에서 가장 흔한 색 (맨 왼쪽: 프로필/말풍선이 안 닿는 여백)
+    public int Background(int x)
+    {
+        var counts = new Dictionary<int, int>();
+        int bg = 0, best = 0;
+        for (int y = 0; y < H; y += 2)
+        {
+            int c = At(x, y), n;
+            counts.TryGetValue(c, out n);
+            counts[c] = ++n;
+            if (n > best) { best = n; bg = c; }
+        }
+        return bg;
+    }
+}
+
+/// 메시지 목록의 세로 윤곽: 줄마다 오른쪽(내 말풍선 자리)과 왼쪽(남의 말풍선 자리)에 뭐가 있는지
+sealed class Profile
+{
+    public int W, H;
+    public int[] R;        // 오른쪽 끝 근처 픽셀 해시 (배경뿐이면 0)
+    public bool[] L;       // 왼쪽에 뭔가 있음 (남의 프로필/말풍선)
+    public int Bottom;     // 내용이 있는 마지막 줄 + 1
+    public bool AtBottom;  // 스크롤이 맨 아래
 }
 
 // MARK: - UI Automation helpers
@@ -393,13 +520,6 @@ static class Deleter
     public static int Scale = 100;  // DPI %
     static int S(int v) { return v * Scale / 100; }
 
-    static string Squash(string s)
-    {
-        var sb = new StringBuilder(s.Length);
-        foreach (char c in s) if (!char.IsWhiteSpace(c)) sb.Append(c);
-        return sb.ToString();
-    }
-
     static bool HasAny(string s, string[] marks)
     {
         foreach (var m in marks) if (s.Contains(m)) return true;
@@ -424,73 +544,103 @@ static class Deleter
         return lr;
     }
 
-    /// 방금 보낸 내 말풍선의 화면 좌표. 감지 시점 좌표는 못 믿으므로 (행이 밀림) 삭제 직전에 매번 새로 찾음.
-    ///  1) 목록이 UIA로 읽히면: 끝에서부터 내용이 같은 항목을 찾아 그 줄 안에서만 말풍선을 찾음
-    ///  2) 안 읽히면: 화면을 캡처해 맨 아래쪽의 오른쪽 정렬(= 내 것) 말풍선을 찾음
-    static Point? FindBubble(Chat chat, string text)
+    /// 내 말풍선(오른쪽 정렬) 후보들의 화면 좌표, 아래쪽 것부터. 감지 시점 좌표는 못 믿으므로 삭제 직전에 매번 새로 찾음.
+    static List<Point> FindBubbles(Chat chat, int max)
     {
+        var o = new List<Point>();
         var lr = ListArea(chat);
-        if (lr.Width < S(120) || lr.Height < S(40)) return null;
-        int top = Math.Max(0, lr.Height - S(400)), bottom = lr.Height - 1;  // 방금 보낸 건 맨 아래쪽에 있음
-        bool haveRow = false;
-
-        var listEl = Ax.From(chat.List);
-        var items = listEl == null ? new List<AutomationElement>() : Ax.LastKids(listEl, 14);
-        items.RemoveAll(e => { try { return e.Current.NativeWindowHandle != 0; } catch { return true; } });
-        if (items.Count > 0)
+        if (lr.Width < S(120) || lr.Height < S(40)) return o;
+        var snap = Snap.Of(chat.List);
+        int w = Math.Min(lr.Width, snap.W), bg = snap.Background(S(3));
+        int top = Math.Max(0, snap.H - S(700));  // 방금 보낸 건 아래쪽에 있음
+        int[] probes = { w - S(30), w - S(48), w - S(66) };
+        Func<int, int> own = y => { foreach (int x in probes) if (Snap.Diff(snap.At(x, y), bg) > 30) return x; return -1; };
+        for (int y = snap.H - 1; y >= top && o.Count < max; y--)
         {
-            string want = Squash(text);
-            AutomationElement hit = null;
-            foreach (var it in items)  // 최근 것부터
+            if (own(y) < 0) continue;
+            int y2 = y;
+            while (y2 > top && own(y2 - 1) >= 0) y2--;
+            if (y - y2 + 1 >= S(14))
             {
-                if (want.Length > 0 && Squash(Ax.Name(it)).Contains(want)) { hit = it; break; }
+                int mid = (y + y2) / 2, x = own(mid);
+                o.Add(new Point(lr.Left + (x < 0 ? probes[0] : x), lr.Top + mid));
             }
-            if (hit == null)
-            {
-                Log.Write("내용 일치 없음: len" + want.Length + ", 최근 항목 " + items.Count + "개");
-                return null;
-            }
-            var row = Rectangle.Intersect(Ax.Bounds(hit), lr);
-            if (row.Height < 4) { Log.Write("일치 항목이 화면 밖"); return null; }
-            if (row.Width < lr.Width * 9 / 10)   // 항목 영역이 곧 말풍선
-                return new Point(row.Left + row.Width / 2, row.Top + row.Height / 2);
-            top = row.Top - lr.Top;
-            bottom = row.Bottom - lr.Top - 1;
-            haveRow = true;
+            y = y2;
         }
+        return o;
+    }
 
-        using (var bmp = N.Capture(chat.List))
+    public static Profile Build(Chat chat)
+    {
+        if (!N.IsWindow(chat.Window) || N.IsIconic(chat.Window) || !N.IsWindowVisible(chat.Window)) return null;
+        var lr = ListArea(chat);
+        if (lr.Width < S(160) || lr.Height < S(60)) return null;
+        var snap = Snap.Of(chat.List);
+        int w = Math.Min(lr.Width, snap.W), bg = snap.Background(S(3));
+        var p = new Profile { W = w, H = snap.H, R = new int[snap.H], L = new bool[snap.H], AtBottom = true };
+        int[] rx = { w - S(26), w - S(30), w - S(34), w - S(38) }, lx = { S(24), S(70) };
+        for (int y = 0; y < snap.H; y++)
         {
-
-            // 배경색 = 맨 왼쪽 세로줄에서 가장 흔한 색 (프로필/말풍선이 안 닿는 여백)
-            var counts = new Dictionary<int, int>();
-            int bgArgb = 0, best = 0;
-            for (int y = 0; y < lr.Height; y += 2)
-            {
-                int c = bmp.GetPixel(S(3), y).ToArgb(), n;
-                counts.TryGetValue(c, out n);
-                counts[c] = ++n;
-                if (n > best) { best = n; bgArgb = c; }
-            }
-            Color bg = Color.FromArgb(bgArgb);
-
-            // 오른쪽 가장자리 근처에 배경 아닌 덩어리가 있으면 내 말풍선 (남의 것은 왼쪽 정렬)
-            int[] probes = { lr.Width - S(30), lr.Width - S(48), lr.Width - S(66) };
-            for (int y = bottom; y >= top; y--)
-            {
-                foreach (int x in probes)
-                {
-                    if (Diff(bmp.GetPixel(x, y), bg) <= 30) continue;
-                    int y2 = y;
-                    while (y2 > top && Diff(bmp.GetPixel(x, y2 - 1), bg) > 30) y2--;
-                    if (y - y2 + 1 >= S(14))
-                        return new Point(lr.Left + x, lr.Top + (y + y2) / 2);
-                }
-            }
+            int hash = 17;
+            bool any = false;
+            foreach (int x in rx) { int c = snap.At(x, y); any |= Snap.Diff(c, bg) > 30; hash = unchecked(hash * 31 + c); }
+            p.R[y] = any ? (hash | 1) : 0;
+            foreach (int x in lx) p.L[y] |= Snap.Diff(snap.At(x, y), bg) > 30;
+            if (any || p.L[y]) p.Bottom = y + 1;
         }
-        if (haveRow) return new Point(lr.Right - S(50), lr.Top + (top + bottom) / 2);
-        Log.Write("오른쪽 정렬 말풍선 못 찾음 (UIA 항목 없음, 픽셀 탐색 실패)");
-        return null;
+        // 스크롤 막대 손잡이가 맨 아래에 닿아 있는지 (손잡이는 막대보다 좁아서 가운데와 가장자리 색이 다름)
+        foreach (var k in N.Children(chat.List))
+        {
+            if (!N.IsWindowVisible(k)) continue;
+            var sr = N.Rect(k);
+            if (sr.Width < 4 || sr.Height < S(40) || sr.Width > S(40)) continue;
+            var sc = Snap.Of(k);
+            int y = sc.H - S(10);
+            p.AtBottom = Snap.Diff(sc.At(sc.W / 2, y), sc.At(1, y)) > 10;
+        }
+        return p;
+    }
+
+    static bool Same(Profile a, Profile b)
+    {
+        if (a.W != b.W || a.H != b.H || a.Bottom != b.Bottom) return false;
+        for (int y = 0; y < a.H; y++) if (a.R[y] != b.R[y] || a.L[y] != b.L[y]) return false;
+        return true;
+    }
+
+    /// 보내기 전 모양(before)과 달라지고, 맨 아래 내용이 내 말풍선(오른쪽 정렬)이 될 때까지 기다림.
+    /// 지연이 0초여도 아직 안 그려진 말풍선 대신 그 위의 옛 메시지를 지우는 일이 없게.
+    public static bool WaitNewOwn(Chat chat, Profile before, int ms)
+    {
+        return Until(ms, () =>
+        {
+            var p = Build(chat);
+            if (p == null || p.Bottom < S(14)) return false;
+            if (before != null && Same(before, p)) return false;
+            for (int y = p.Bottom - S(12); y < p.Bottom; y++) if (p.R[y] == 0 || p.L[y]) return false;
+            return true;
+        });
+    }
+
+    /// 채팅창에 딸린 "클립보드 이미지 전송" 창 (설명 입력칸이 있는 작은 창)
+    public static IntPtr SendDialog(Chat chat)
+    {
+        IntPtr found = IntPtr.Zero;
+        foreach (var h in N.TopWindows(N.Pid(chat.Window)))
+        {
+            if (h == chat.Window || !N.Class(h).StartsWith("EVA_Window", StringComparison.Ordinal)) continue;
+            var r = N.Rect(h);
+            if (r.Width > S(500) || r.Height < S(200) || N.Title(h) == Config.MainWindowTitle) continue;
+            bool edit = false, list = false;
+            foreach (var k in N.Children(h))
+            {
+                string c = N.Class(k);
+                if (c == "Edit" && N.IsWindowVisible(k) && N.Rect(k).Width > S(100)) edit = true;
+                if (c.StartsWith(Config.ListClass, StringComparison.Ordinal)) list = true;
+            }
+            if (edit && !list) found = h;
+        }
+        return found;
     }
 
     static List<IntPtr> NewWindows(uint pid, HashSet<IntPtr> before)
@@ -525,7 +675,7 @@ static class Deleter
     }
 
     /// 조건이 될 때까지 짧게 반복 확인 (고정 대기 대신: 되는 즉시 다음 단계로)
-    static bool Until(int ms, Func<bool> ok)
+    public static bool Until(int ms, Func<bool> ok)
     {
         var sw = Stopwatch.StartNew();
         do
@@ -550,19 +700,29 @@ static class Deleter
 
     /// 말풍선 우클릭 → 메뉴에서 ↑ 키로 "삭제 >" 줄까지 이동 → → 키로 하위 메뉴. 열린 메뉴는 opened에 쌓임.
     /// 메뉴는 실제 마우스 위치를 따라가서 마우스 메시지로는 불안정함. 키 메시지는 안정적.
-    static IntPtr OpenDeleteSubmenu(Chat chat, Point bubble, HashSet<IntPtr> known, List<IntPtr> opened)
+    enum Open { Ok, Retry, NotDeletable, Unknown }
+
+    static IntPtr OpenDeleteSubmenu(Chat chat, Point bubble, HashSet<IntPtr> known, List<IntPtr> opened, out Open status)
     {
+        status = Open.Retry;
         uint pid = N.Pid(chat.Window);
         N.Click(chat.List, bubble, true);
         var menu = WaitMenu(pid, known, 700);
         if (menu == IntPtr.Zero) { Log.Write("우클릭 " + bubble + " 메뉴 안 뜸"); return IntPtr.Zero; }
         opened.Add(menu);
         known.Add(menu);
-        Point? arrow = null;
-        if (!Until(400, () => (arrow = ArrowRow(menu)) != null)) { Log.Write("메뉴에서 '삭제 >' 줄 못 찾음"); return IntPtr.Zero; }
-        int arrowY = arrow.Value.Y - N.Rect(menu).Top;
+        var arrows = new List<int>();
+        Until(400, () => (arrows = ArrowRows(menu)).Count > 0);
+        if (arrows.Count != 1)
+        {
+            // 0개: 이미 삭제된 메시지 등 "삭제 >"가 없는 말풍선. 2개 이상: 모르는 메뉴 → 건드리지 않음
+            status = arrows.Count == 0 ? Open.NotDeletable : Open.Unknown;
+            Log.Write("메뉴의 화살표 줄 " + arrows.Count + "개");
+            return IntPtr.Zero;
+        }
+        int arrowY = arrows[0];
         bool on = false;
-        for (int i = 0; i < 14 && !on; i++)   // 삭제는 아래쪽에 있어서 ↑가 빠름
+        for (int i = 0; i < 16 && !on; i++)   // 삭제는 아래쪽에 있어서 ↑가 빠름
         {
             int was = LitRow(menu);
             N.Key(menu, 0x26);
@@ -576,7 +736,10 @@ static class Deleter
         if (sub == IntPtr.Zero) { Log.Write("→ 키로 하위 메뉴 안 뜸"); return IntPtr.Zero; }
         opened.Add(sub);
         known.Add(sub);
-        Until(300, () => TextRows(sub).Count == 2);  // 다 그려질 때까지
+        int rows = 0;
+        Until(300, () => (rows = TextRows(sub).Count) == 2);  // 다 그려질 때까지
+        status = rows == 2 ? Open.Ok : rows == 1 ? Open.NotDeletable : Open.Retry;  // 한 줄: "나에게서만"뿐 (5분 지남)
+        if (rows != 2) Log.Write("삭제 하위 메뉴 " + rows + "줄");
         return sub;
     }
 
@@ -705,13 +868,13 @@ static class Deleter
         }
     }
 
-    public static bool DeleteForEveryone(Chat chat, string text)
+    public static bool DeleteForEveryone(Chat chat)
     {
-        try { return Run(chat, text); }
+        try { return Run(chat); }
         catch (Exception ex) { Log.Write("예외: " + ex); return false; }
     }
 
-    static bool Run(Chat chat, string text)
+    static bool Run(Chat chat)
     {
         if (!N.IsWindow(chat.Window) || N.IsIconic(chat.Window)) { Log.Write("채팅창이 닫혔거나 최소화됨"); return false; }
         uint pid = N.Pid(chat.Window);
@@ -719,27 +882,30 @@ static class Deleter
 
         // 1) 말풍선 우클릭 → 메뉴 "삭제 >" → 하위 메뉴 첫 줄 "모두에게서 삭제"
         //    하위 메뉴가 두 줄(모두에게서/나에게서만)이 아니면 아무것도 안 누르고 닫음
+        //    "삭제 >"가 아직 없으면 (전송 중) 잠깐 기다렸다 다시. 위쪽 옛 메시지로는 절대 안 넘어감.
         bool clicked = false;
-        for (int attempt = 1; attempt <= 4 && !clicked; attempt++)
+        for (int attempt = 1; attempt <= 10 && !clicked; attempt++)
         {
-            if (attempt > 1) Thread.Sleep(150);
-            var pt = FindBubble(chat, text);
-            if (pt == null) { Log.Write("[" + attempt + "] 보낸 말풍선 못 찾음, 재시도"); continue; }
-
+            if (attempt > 1) Thread.Sleep(200);
+            var pts = FindBubbles(chat, 1);
+            if (pts.Count == 0) { Log.Write("[" + attempt + "] 내 말풍선 못 찾음, 재시도"); continue; }
             var known = new HashSet<IntPtr>(before);
             var opened = new List<IntPtr>();
-            var sub = OpenDeleteSubmenu(chat, pt.Value, known, opened);
-            var rows = sub == IntPtr.Zero ? new List<int>() : TextRows(sub);
-            if (rows.Count != 2)
+            Open st;
+            var sub = OpenDeleteSubmenu(chat, pts[0], known, opened, out st);
+            if (st == Open.Ok)
             {
-                Log.Write("[" + attempt + "] 삭제 하위 메뉴가 두 줄이 아님 (" + rows.Count + "줄)");
-                DumpWindows("메뉴", opened);
-                CloseMenus(opened);
-                continue;
+                clicked = PickFirstRow(opened, sub, TextRows(sub));
+                Log.Write("[" + attempt + "] '모두에게서 삭제' " + (clicked ? "누름" : "못 누름"));
             }
-            clicked = PickFirstRow(opened, sub, rows);
-            Log.Write("[" + attempt + "] '모두에게서 삭제' " + (clicked ? "누름" : "못 누름"));
-            if (!clicked) { DumpWindows("메뉴", opened); CloseMenus(opened); }
+            else if (st == Open.NotDeletable) Log.Write("[" + attempt + "] 아직 모두에게서 삭제 불가 (전송 중이거나 5분 지남)");
+            else if (st == Open.Unknown) { DumpWindows("모르는 메뉴", opened); CloseMenus(opened); return false; }
+            if (!clicked)
+            {
+                if (st == Open.Retry) DumpWindows("메뉴", opened);
+                CloseMenus(opened);
+                Until(300, () => MenusClosed(opened));
+            }
             foreach (var m in opened) before.Add(m);
         }
         if (!clicked) return false;
@@ -775,15 +941,15 @@ static class Deleter
         return false;
     }
 
-    /// 메뉴(EVA_Menu)는 UIA로 안 읽힘. 하위 메뉴 화살표(>)가 있는 유일한 줄 = "삭제". 그 줄의 화면 좌표.
-    static Point? ArrowRow(IntPtr menu)
+    /// 메뉴(EVA_Menu)는 UIA로 안 읽힘. 하위 메뉴 화살표(>)가 있는 줄들의 세로 중심 (창 기준). "삭제"가 유일한 화살표 줄.
+    static List<int> ArrowRows(IntPtr menu)
     {
+        var hits = new List<int>();
         var r = N.Rect(menu);
-        if (r.Width < S(60) || r.Height < S(40)) return null;
+        if (r.Width < S(60) || r.Height < S(40)) return hits;
         using (var bmp = N.Capture(menu))
         {
             int w = r.Width, x0 = w * 78 / 100, x1 = w * 92 / 100, t0 = w * 60 / 100, t1 = w * 76 / 100;
-            var hits = new List<int>();
             int start = -1;
             for (int y = S(3); y <= r.Height - S(3); y++)
             {
@@ -801,9 +967,8 @@ static class Deleter
                     for (int x = t0; x < t1 && !text; x++) text = Diff(bmp.GetPixel(x, yy), bmp.GetPixel(w - S(4), yy)) > 90;
                 if (!text) hits.Add((a + b) / 2);
             }
-            if (hits.Count != 1) { Log.Write("화살표 줄 " + hits.Count + "개 (1개여야 함)"); return null; }
-            return new Point(r.Left + w / 2, r.Top + hits[0]);
         }
+        return hits;
     }
 
     /// --menushot: 맨 아래 내 말풍선의 메뉴와 삭제 하위 메뉴 모양만 menuN.png 로 저장하고 닫음 (삭제 안 함)
@@ -814,13 +979,14 @@ static class Deleter
         if (chat == null) return "채팅창 없음";
         uint pid = N.Pid(chat.Window);
         var known = new HashSet<IntPtr>(N.TopWindows(pid));
-        var pt = FindBubble(chat, "");
-        if (pt == null) return "내 말풍선 못 찾음";
-        var sb = new StringBuilder("우클릭 " + pt.Value);
+        var pts = FindBubbles(chat, 4);
+        if (pts.Count == 0) return "내 말풍선 못 찾음";
+        var sb = new StringBuilder("내 말풍선 " + pts.Count + "개, 우클릭 " + pts[0]);
         var opened = new List<IntPtr>();
         var sw = Stopwatch.StartNew();
-        var sub = OpenDeleteSubmenu(chat, pt.Value, known, opened);
-        sb.Append(" / 메뉴 " + opened.Count + "개 " + sw.ElapsedMilliseconds + "ms");
+        Open st;
+        var sub = OpenDeleteSubmenu(chat, pts[0], known, opened, out st);
+        sb.Append(" / " + st + " 메뉴 " + opened.Count + "개 " + sw.ElapsedMilliseconds + "ms");
         for (int i = 0; i < opened.Count; i++)
             using (var bmp = N.Capture(opened[i])) bmp.Save(Path.Combine(Log.Dir, "menu" + i + ".png"));
         if (sub != IntPtr.Zero)
@@ -832,6 +998,79 @@ static class Deleter
         Thread.Sleep(200);
         foreach (var m in opened) sb.Append(" / 닫힘=" + !N.IsWindow(m));
         return sb.ToString();
+    }
+
+    // MARK: 글을 이미지로 보내기
+
+    static Bitmap Render(string text)
+    {
+        text = text.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd();
+        using (var font = new Font("Malgun Gothic", 30, FontStyle.Regular, GraphicsUnit.Pixel))
+        {
+            SizeF size;
+            using (var tmp = new Bitmap(1, 1))
+            using (var g = Graphics.FromImage(tmp)) size = g.MeasureString(text, font, 900);
+            int pad = 28;
+            var bmp = new Bitmap((int)Math.Ceiling(size.Width) + pad * 2, (int)Math.Ceiling(size.Height) + pad * 2);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.White);
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                g.DrawString(text, font, Brushes.Black, new RectangleF(pad, pad, size.Width + 1, size.Height + 1));
+            }
+            return bmp;
+        }
+    }
+
+    /// 글을 그림으로 만들어 클립보드에 넣고, 입력창에 Ctrl+V 를 보내 "클립보드 이미지 전송" 창을 띄운 뒤 Enter.
+    /// STA 스레드에서 불러야 함 (클립보드). 원래 클립보드의 글/그림은 끝나고 되돌림.
+    public static bool SendAsImage(Chat chat, string text)
+    {
+        Until(1500, () => N.GetAsyncKeyState(0x11) >= 0 && N.GetAsyncKeyState(0x12) >= 0 && N.GetAsyncKeyState(0x10) >= 0 && N.GetAsyncKeyState(0x0D) >= 0);  // 단축키에서 손 뗄 때까지
+        Thread.Sleep(60);
+        string oldText = null;
+        Image oldImage = null;
+        try { if (Clipboard.ContainsImage()) oldImage = Clipboard.GetImage(); else if (Clipboard.ContainsText()) oldText = Clipboard.GetText(); } catch { }
+        try
+        {
+            using (var bmp = Render(text)) Clipboard.SetImage(bmp);
+            uint pid = N.Pid(chat.Window);
+            var before = new HashSet<IntPtr>(N.TopWindows(pid));
+            N.CtrlKey(chat.Edit, 0x56);  // Ctrl+V
+            IntPtr dlg = IntPtr.Zero, edit = IntPtr.Zero;
+            Until(1500, () =>
+            {
+                foreach (var h in NewWindows(pid, before))
+                    foreach (var k in N.Children(h))
+                        if (N.Class(k) == "Edit" && N.IsWindowVisible(k)) { dlg = h; edit = k; return true; }
+                return false;
+            });
+            if (dlg == IntPtr.Zero) { Log.Write("이미지 전송 창이 안 뜸"); return false; }
+            Thread.Sleep(150);
+            Func<bool> closed = () => !N.IsWindow(dlg) || !N.IsWindowVisible(dlg);
+            N.Key(edit, N.VK_RETURN);
+            if (!Until(700, closed)) { Log.Write("Enter→설명칸 안 먹음"); N.Key(dlg, N.VK_RETURN); }
+            if (!Until(700, closed))
+            {
+                var r = N.Rect(dlg);   // 맨 아래 "전송" 버튼
+                Log.Write("Enter→창 안 먹음, 전송 버튼 클릭");
+                N.Click(dlg, new Point(r.Left + r.Width / 2, r.Bottom - S(22)), false);
+            }
+            if (!Until(700, closed))
+            {
+                Log.Write("이미지 전송 창이 안 닫힘 → 취소");
+                DumpWindows("이미지 전송 창", new List<IntPtr> { dlg });
+                N.Key(dlg, N.VK_ESCAPE);
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex) { Log.Write("이미지 전송 예외: " + ex.Message); return false; }
+        finally
+        {
+            Thread.Sleep(300);
+            try { if (oldImage != null) Clipboard.SetImage(oldImage); else if (oldText != null) Clipboard.SetText(oldText); else Clipboard.Clear(); } catch { }
+        }
     }
 
     /// --dump: 삭제 없이 카톡 창 구조만 기록
@@ -850,8 +1089,10 @@ static class Deleter
             if (root != null) Ax.Dump(root, w, 1, 5);
             if (chat != null)
             {
-                var pt = FindBubble(chat, "");
-                w("   입력창 글자 수=" + N.TextLength(chat.Edit) + " 맨 아래 내 말풍선(픽셀)=" + (pt == null ? "없음" : pt.Value.ToString()));
+                var pts = FindBubbles(chat, 4);
+                var prof = Build(chat);
+                w("   입력창 글자 수=" + N.TextLength(chat.Edit) + " 내 말풍선(픽셀)=" + string.Join(" ", pts) +
+                    (prof == null ? "" : " 내용 끝=" + prof.Bottom + "/" + prof.H + " 맨아래=" + prof.AtBottom));
             }
             return true;
         }, IntPtr.Zero);
@@ -888,6 +1129,9 @@ sealed class App : Form
     readonly Stopwatch clock = Stopwatch.StartNew();
 
     readonly List<Armed> armed = new List<Armed>();
+    volatile Armed[] watch = new Armed[0];   // 감시 스레드가 보는 사본
+    Point lastClickAt;
+    readonly HashSet<IntPtr> imageBusy = new HashSet<IntPtr>();   // 우리가 이미지 전송 창을 다루는 중인 채팅창
     Chat current;                    // 트레이가 붙어 있는 채팅창
     IntPtr flashWindow; string flashText; long flashUntil;  // ⏳/✅/❌ 잠깐 표시
     IntPtr lastFg; Chat lastFgChat;
@@ -920,13 +1164,17 @@ sealed class App : Form
         StartPosition = FormStartPosition.Manual;
         AutoScaleMode = AutoScaleMode.None;
         BackColor = Color.FromArgb(40, 40, 43);
-        ClientSize = new Size(S(206), S(32));
+        ClientSize = new Size(S(236), S(32));
         Font = new Font("Segoe UI", 9f);
 
         int x = S(5), y = S(4), h = S(24);
         bomb.SetBounds(x, y, S(98), h);
         bomb.Click += (s, e) => { if (current != null) Toggle(current); };
         x += S(98) + S(3);
+        var image = new TrayButton { Text = "🖼" };   // 입력창의 글을 이미지로 보내고 삭제
+        image.SetBounds(x, y, S(27), h);
+        image.Click += (s, e) => { if (current != null) SendImage(current); };
+        x += S(27) + S(3);
         var dec = new TrayButton { Text = "−" };
         dec.SetBounds(x, y, S(24), h);
         dec.Click += (s, e) => SetDelay(delay - 0.1);
@@ -938,10 +1186,11 @@ sealed class App : Form
         var inc = new TrayButton { Text = "+" };
         inc.SetBounds(x, y, S(24), h);
         inc.Click += (s, e) => SetDelay(delay + 0.1);
-        Controls.AddRange(new Control[] { bomb, dec, delayLabel, inc });
+        Controls.AddRange(new Control[] { bomb, image, dec, delayLabel, inc });
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(new ToolStripMenuItem("카톡 채팅창 옆 💣 버튼 또는 Ctrl+Alt+D로 장전/해제") { Enabled = false });
+        menu.Items.Add(new ToolStripMenuItem("🖼 버튼 또는 Ctrl+Alt+Enter: 입력한 글을 이미지로 보내고 삭제") { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
         delayMenu.DropDownItems.Add("-");  // 열릴 때 채움
         delayMenu.DropDownOpening += (s, e) => FillDelayMenu();
@@ -959,6 +1208,9 @@ sealed class App : Form
         var worker = new Thread(() => { foreach (var job in deleteQueue.GetConsumingEnumerable()) job(); });
         worker.IsBackground = true;
         worker.Start();
+        var watcher = new Thread(WatchLoop);
+        watcher.IsBackground = true;
+        watcher.Start();
 
         timer.Interval = Config.PollMs;
         timer.Tick += (s, e) => Tick();
@@ -971,12 +1223,17 @@ sealed class App : Form
     {
         base.OnHandleCreated(e);
         bool ok = N.RegisterHotKey(Handle, 1, 0x2 | 0x1 | 0x4000, (uint)Keys.D);  // Ctrl+Alt+D, 반복 없음
-        Log.Write("단축키 등록 " + (ok ? "성공" : "실패 (다른 프로그램이 Ctrl+Alt+D 사용 중)") + " hwnd=" + Handle.ToString("X"));
+        bool ok2 = N.RegisterHotKey(Handle, 2, 0x2 | 0x1 | 0x4000, (uint)Keys.Return);  // Ctrl+Alt+Enter
+        Log.Write("단축키 등록 Ctrl+Alt+D " + (ok ? "성공" : "실패") + ", Ctrl+Alt+Enter " + (ok2 ? "성공" : "실패") + " hwnd=" + Handle.ToString("X"));
     }
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == 0x0312) HotKey();
+        if (m.Msg == 0x0312)
+        {
+            if (m.WParam.ToInt32() == 2) ImageHotKey();
+            else HotKey();
+        }
         base.WndProc(ref m);
     }
 
@@ -1089,20 +1346,75 @@ sealed class App : Form
         Refresh2();
     }
 
+    void ImageHotKey()
+    {
+        var chat = Chat.From(N.GetForegroundWindow());
+        if (chat == null) { SystemSounds.Beep.Play(); return; }
+        SendImage(chat);
+    }
+
+    /// 입력창에 쓴 글을 지우고 그 글을 그린 이미지를 대신 보냄. 올라온 이미지는 장전 여부와 상관없이 삭제.
+    void SendImage(Chat chat)
+    {
+        string text = Armed.Read(chat);
+        if (text == null || text.Trim().Length == 0) { SystemSounds.Beep.Play(); return; }
+        N.SetText(chat.Edit, "");
+        var a = armed.Find(x => x.Chat.Window == chat.Window);
+        if (a != null) a.ResetInput();
+        var before = Deleter.Build(chat);   // 보내기 전 모양
+        imageBusy.Add(chat.Window);
+        Log.Write("이미지로 보내기: len" + text.Length);
+        SetFlash(chat.Window, "🖼 전송", clock.ElapsedMilliseconds + 3000);
+        var t = new Thread(() =>
+        {
+            bool ok = Deleter.SendAsImage(chat, text);
+            if (!ok) N.SetText(chat.Edit, text);   // 못 보냈으면 쓴 글을 되돌려 놓음
+            BeginInvoke((Action)(() =>
+            {
+                imageBusy.Remove(chat.Window);
+                if (ok) { Fire(chat, before, "이미지로 보내기"); return; }
+                SystemSounds.Hand.Play();
+                SetFlash(chat.Window, "❌ 전송 실패", clock.ElapsedMilliseconds + 1500);
+            }));
+        });
+        t.SetApartmentState(ApartmentState.STA);   // 클립보드
+        t.IsBackground = true;
+        t.Start();
+    }
+
     // MARK: loop
+
+    /// 장전된 창의 목록 모양을 계속 기록해 둠 (전송 감지 순간에 "보내기 전 모양"으로 씀)
+    void WatchLoop()
+    {
+        while (true)
+        {
+            Thread.Sleep(80);
+            foreach (var a in watch)
+            {
+                try
+                {
+                    var cur = Deleter.Build(a.Chat);
+                    if (cur != null) a.Remember(clock.ElapsedMilliseconds, cur);
+                }
+                catch (Exception ex) { Log.Write("감시 예외: " + ex.Message); }
+            }
+        }
+    }
 
     void Tick()
     {
         long now = clock.ElapsedMilliseconds;
-        if (N.GetAsyncKeyState(N.VK_RETURN) != 0) lastEnter = now;
-        if (N.GetAsyncKeyState(N.VK_LBUTTON) != 0) lastClick = now;  // 전송 버튼 클릭
+        if (N.GetAsyncKeyState(N.VK_RETURN) != 0) Interlocked.Exchange(ref lastEnter, now);
+        if (N.GetAsyncKeyState(N.VK_LBUTTON) != 0) { Interlocked.Exchange(ref lastClick, now); lastClickAt = Cursor.Position; }  // 전송 버튼 클릭
         bool sendKey = now - lastEnter < Config.SendKeyWindowMs || now - lastClick < Config.SendKeyWindowMs;
 
         if (armed.RemoveAll(a => !N.IsWindow(a.Chat.Window)) > 0) Refresh2();  // 닫힌 채팅창
         foreach (var a in armed.ToArray())
         {
             string text = a.Poll(sendKey, now - lastEnter, now - lastClick);
-            if (text != null) Fire(a.Chat, text);
+            if (text != null) Fire(a.Chat, a.Before(now, 300), "글");
+            PollDialog(a, now);
         }
         if (flashText != null && flashUntil > 0 && now > flashUntil) { flashText = null; Refresh2(); }
         FollowFocusedChat();
@@ -1144,18 +1456,40 @@ sealed class App : Form
         if (Location != pick.Location) Location = pick.Location;
     }
 
-    void Fire(Chat chat, string text)
+    /// 사진 붙여넣기: "클립보드 이미지 전송" 창이 Enter 또는 맨 아래 "전송" 클릭으로 닫히면 보낸 것 (Esc/X 는 취소)
+    void PollDialog(Armed a, long now)
+    {
+        if (imageBusy.Contains(a.Chat.Window)) { a.Dialog = IntPtr.Zero; return; }
+        if (a.Dialog == IntPtr.Zero)
+        {
+            if (N.GetForegroundWindow() == a.Chat.Window) return;   // 전송 창이 떠 있으면 그게 맨 앞
+            a.Dialog = Deleter.SendDialog(a.Chat);
+            if (a.Dialog != IntPtr.Zero) { a.DialogRect = N.Rect(a.Dialog); Log.Write("이미지 전송 창 뜸"); }
+            return;
+        }
+        if (N.IsWindow(a.Dialog) && N.IsWindowVisible(a.Dialog)) { a.DialogRect = N.Rect(a.Dialog); return; }
+        var r = a.DialogRect;
+        a.Dialog = IntPtr.Zero;
+        bool enter = now - lastEnter < 500;
+        bool sendClick = now - lastClick < 500 && r.Contains(lastClickAt) && lastClickAt.Y > r.Bottom - S(60);
+        Log.Write("이미지 전송 창 닫힘: Enter=" + enter + " 전송클릭=" + sendClick);
+        if (enter || sendClick) Fire(a.Chat, a.Before(now, 300), "사진");
+    }
+
+    void Fire(Chat chat, Profile before, string kind)
     {
         // 장전은 유지 (토글). 연달아 보내도 메뉴 조작이 겹치지 않게 삭제는 한 번에 하나씩.
-        Log.Write("전송 감지: len" + text.Length + ", 지연 " + delay.ToString("0.0") + "초");
+        Log.Write("전송 감지 (" + kind + "), 지연 " + delay.ToString("0.0") + "초");
         pending++;
         SetFlash(chat.Window, "⏳", 0);
         long due = clock.ElapsedMilliseconds + (long)(delay * 1000);
         deleteQueue.Add(() =>
         {
+            bool seen = Deleter.WaitNewOwn(chat, before, 4000);
+            if (!seen) Log.Write("새 말풍선이 안 보임 (그래도 진행)");
             long wait = due - clock.ElapsedMilliseconds;
             if (wait > 0) Thread.Sleep((int)wait);
-            bool ok = Deleter.DeleteForEveryone(chat, text);
+            bool ok = Deleter.DeleteForEveryone(chat);
             Log.Write(ok ? "삭제됨" : "실패");
             BeginInvoke((Action)(() =>
             {
@@ -1174,8 +1508,10 @@ sealed class App : Form
 
     void Refresh2()
     {
-        status.Icon = armed.Count == 0 ? idleIcon : armedIcon;
-        status.Text = armed.Count == 0 ? "kakao-bomb" : "kakao-bomb — 장전됨 (" + armed.Count + ")";
+        watch = armed.ToArray();
+        int n = armed.Count;
+        status.Icon = n == 0 ? idleIcon : armedIcon;
+        status.Text = n == 0 ? "kakao-bomb" : "kakao-bomb — 장전됨 (" + n + ")";
         delayLabel.Text = delay.ToString("0.0") + "초";
         if (current == null) return;
         if (flashText != null && flashWindow == current.Window) bomb.Text = flashText;

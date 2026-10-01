@@ -32,6 +32,15 @@ func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
     var v: AnyObject?
     return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
 }
+/// AX 속성을 타입 확인 후 변환 (카톡 UI가 바뀌는 중이면 엉뚱한 타입/nil이 올 수 있어 강제 캐스트 금지)
+func elem(_ o: AnyObject?) -> AXUIElement? {
+    guard let o, CFGetTypeID(o) == AXUIElementGetTypeID() else { return nil }
+    return (o as! AXUIElement)
+}
+func axValue(_ o: AnyObject?) -> AXValue? {
+    guard let o, CFGetTypeID(o) == AXValueGetTypeID() else { return nil }
+    return (o as! AXValue)
+}
 func str(_ e: AXUIElement, _ name: String) -> String { attr(e, name) as? String ?? "" }
 func role(_ e: AXUIElement) -> String { str(e, kAXRoleAttribute) }
 func kids(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
@@ -45,10 +54,10 @@ func actions(_ e: AXUIElement) -> [String] {
     return names as? [String] ?? []
 }
 func frame(_ e: AXUIElement) -> CGRect? {
-    guard let p = attr(e, kAXPositionAttribute), let s = attr(e, kAXSizeAttribute) else { return nil }
+    guard let p = axValue(attr(e, kAXPositionAttribute)), let s = axValue(attr(e, kAXSizeAttribute)) else { return nil }
     var pt = CGPoint.zero, sz = CGSize.zero
-    AXValueGetValue(p as! AXValue, .cgPoint, &pt)
-    AXValueGetValue(s as! AXValue, .cgSize, &sz)
+    AXValueGetValue(p, .cgPoint, &pt)
+    AXValueGetValue(s, .cgSize, &sz)
     return CGRect(origin: pt, size: sz)
 }
 func contains(_ list: [AXUIElement], _ e: AXUIElement) -> Bool { list.contains { CFEqual($0, e) } }
@@ -133,7 +142,11 @@ func bubble(at i: Int, in t: AXUIElement) -> Bubble? {
 
 func lastBubble(_ t: AXUIElement) -> Bubble? {
     let n = rowCount(t)
-    return (max(0, n - 4)..<n).reversed().lazy.compactMap { bubble(at: $0, in: t) }.first
+    // lazy.compactMap.first는 변환을 두 번 돌리고 두 번째를 강제 언랩함 → 카톡이 그 사이 행을 다시 그리면 크래시. 일반 루프로.
+    for i in stride(from: n - 1, through: max(0, n - 4), by: -1) {
+        if let b = bubble(at: i, in: t) { return b }
+    }
+    return nil
 }
 
 // 남의 메시지: 왼쪽 정렬(+프로필). 내 메시지: 오른쪽 정렬.
@@ -148,7 +161,7 @@ func isMine(_ b: Bubble, in table: AXUIElement) -> Bool {
 
 // 화면 맨 아래에 실제로 보이는 말풍선인지 (위로 스크롤해 과거 기록 로딩될 때 오탐 방지)
 func isVisible(_ b: Bubble, in table: AXUIElement) -> Bool {
-    guard let sa = attr(table, kAXParentAttribute), let sf = frame(sa as! AXUIElement),
+    guard let sa = elem(attr(table, kAXParentAttribute)), let sf = frame(sa),
           let bf = frame(b.shape) else { return false }
     return sf.intersects(bf)
 }
@@ -189,7 +202,8 @@ final class Armed {
 /// 최근 행부터 내 말풍선 중 내용이 같은 것 (같은 말 연속으로 보냈으면 가장 최근 것).
 func findSent(_ sent: Bubble, text: String, in t: AXUIElement) -> Bubble? {
     let n = rowCount(t)
-    let mine = (max(0, sent.index - 5)..<n).reversed().compactMap { bubble(at: $0, in: t) }.filter { isMine($0, in: t) }
+    let mine = stride(from: n - 1, through: max(0, sent.index - 5), by: -1)  // n이 순간 0으로 읽혀도 빈 범위
+        .compactMap { bubble(at: $0, in: t) }.filter { isMine($0, in: t) }
     if let hit = text.isEmpty ? mine.first : mine.first(where: { $0.text == text }) { return hit }
     log("내용 일치 없음: 감지 행 \(sent.index) len\(text.count), 지금 rows \(n), 내 말풍선 "
         + mine.map { "\($0.index):len\($0.text.count)" }.joined(separator: " "))
@@ -199,7 +213,7 @@ func findSent(_ sent: Bubble, text: String, in t: AXUIElement) -> Bubble? {
 // 말풍선 우클릭 메뉴(NSMenu)는 AXShowMenu 대상 요소의 자식으로 붙음
 func contextMenus(_ app: AXUIElement, near target: AXUIElement) -> [AXUIElement] {
     var roots = kids(target) + kids(app)   // 메뉴바(AXMenuBar)는 role이 달라 제외됨
-    if let parent = attr(target, kAXParentAttribute) { roots += kids(parent as! AXUIElement) }
+    if let parent = elem(attr(target, kAXParentAttribute)) { roots += kids(parent) }
     return roots.filter { role($0) == kAXMenuRole }
 }
 
@@ -470,7 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func bombClicked() { if let w = current { toggle(w) } }
 
     func hotKey() {
-        guard let app = kakaoApp(), let w = attr(app, kAXFocusedWindowAttribute).map({ $0 as! AXUIElement }),
+        guard let app = kakaoApp(), let w = elem(attr(app, kAXFocusedWindowAttribute)),
               isChatWindow(w) else { NSSound.beep(); return }
         toggle(w)
     }
@@ -517,7 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func followFocusedChat(_ app: AXUIElement) {
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == kakaoBundleID,
-              let w = attr(app, kAXFocusedWindowAttribute).map({ $0 as! AXUIElement }),
+              let w = elem(attr(app, kAXFocusedWindowAttribute)),
               isChatWindow(w), (attr(w, kAXMinimizedAttribute) as? Bool) != true,
               let f = frame(w) else {
             hideTray()

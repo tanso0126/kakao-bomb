@@ -8,6 +8,7 @@
 import Cocoa
 import ApplicationServices
 import Carbon.HIToolbox
+import ServiceManagement
 
 let defaultDelay: TimeInterval = 0.5
 let maxDelay: TimeInterval = 10
@@ -382,6 +383,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var flash: (window: AXUIElement, text: String)?  // ⏳/✅/❌ 잠깐 표시
     var current: AXUIElement?                         // 트레이가 붙어 있는 채팅창
     var kakao: (pid: pid_t, app: AXUIElement)?
+    var trusted = false
+    var ticks = 0
+    let permissionItem = NSMenuItem(title: "⚠️ 손쉬운 사용 권한 필요 — 설정 열기", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+    let loginItem = NSMenuItem(title: "로그인 시 자동 실행", action: #selector(toggleLoginItem), keyEquivalent: "")
 
     var delay: TimeInterval = UserDefaults.standard.object(forKey: "deleteDelay") as? Double ?? defaultDelay {
         didSet {
@@ -392,16 +397,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // 권한 없으면 시스템이 "손쉬운 사용" 허용 창을 띄움. 허용하면 재시작 없이 바로 동작.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(opts) {
-            print("손쉬운 사용 권한 필요: 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 이 앱(또는 터미널) 허용 후 재실행")
-        }
+        trusted = AXIsProcessTrustedWithOptions(opts)
+
         let menu = NSMenu()
+        menu.delegate = self
+        permissionItem.target = self
+        menu.addItem(permissionItem)
+        let hint = NSMenuItem(title: "카톡 채팅창 옆 💣 버튼 또는 ⌃⌥D로 장전/해제", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
+        menu.addItem(.separator())
         let delayItem = NSMenuItem(title: "삭제 지연", action: nil, keyEquivalent: "")
         delayMenu.delegate = self
         delayItem.submenu = delayMenu
         menu.addItem(delayItem)
+        loginItem.target = self
+        menu.addItem(loginItem)
         menu.addItem(.separator())
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        let versionItem = NSMenuItem(title: "kakao-bomb \(version)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
         menu.addItem(NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         status.menu = menu
         registerHotKey { [weak self] in self?.hotKey() }
@@ -412,6 +430,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === delayMenu else {
+            permissionItem.isHidden = trusted
+            loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            return
+        }
         menu.removeAllItems()
         for d in delayPresets {
             let item = NSMenuItem(title: String(format: "%.1f초", d), action: #selector(pickDelay(_:)), keyEquivalent: "")
@@ -423,6 +446,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: actions
+
+    @objc func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    @objc func toggleLoginItem() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            NSSound.beep()
+            log("로그인 항목 설정 실패: \(error)")
+        }
+    }
 
     @objc func pickDelay(_ sender: NSMenuItem) { delay = sender.representedObject as! Double }
     @objc func decDelay() { delay -= 0.1 }
@@ -457,7 +497,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func tick() {
-        guard let app = kakaoApp() else {
+        ticks += 1
+        if !trusted || ticks % 20 == 0 {  // 권한은 1초마다만 다시 확인
+            let now = AXIsProcessTrusted()
+            if now != trusted { trusted = now; refresh() }
+        }
+        guard trusted, let app = kakaoApp() else {
             armed.removeAll()
             hideTray()
             return
@@ -512,7 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refresh() {
-        status.button?.title = armed.isEmpty ? "💣" : "🔥"
+        status.button?.title = !trusted ? "⚠️" : armed.isEmpty ? "💣" : "🔥"
         tray.delayLabel.stringValue = String(format: "%.1f초", delay)
         guard let w = current else { return }
         if let f = flash, CFEqual(f.window, w) {

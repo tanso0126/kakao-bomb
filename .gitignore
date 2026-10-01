@@ -1,3 +1,5 @@
 kakao-bomb
+build/
+dist/
 *.log
 .DS_Store

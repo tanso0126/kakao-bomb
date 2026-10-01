@@ -1,6 +1,6 @@
 // 카톡 자폭 메시지
-// 채팅창이 앞에 오면 창 옆에 트레이가 자동으로 뜸. 💣 자폭(또는 ⌃⌥D)으로 장전
-// → 그 채팅창에서 다음에 보낸 내 메시지를 설정한 시간(기본 0.5초) 뒤 "모두에게서 삭제".
+// 채팅창이 앞에 오면 창 옆에 트레이가 자동으로 뜸. 💣 자폭(또는 ⌃⌥D)으로 장전/해제 토글
+// → 해제할 때까지 그 채팅창에서 보내는 내 메시지마다 설정한 시간(기본 0.5초) 뒤 "모두에게서 삭제".
 // 지연 시간은 트레이 −/+ 버튼이나 메뉴바 💣 > 삭제 지연에서 조절 (재실행해도 유지).
 // 빌드: swiftc -O -swift-version 5 main.swift -o kakao-bomb
 // 실행: ./kakao-bomb        (--debug: 다이얼로그 구조를 stderr로 출력)
@@ -14,6 +14,7 @@ let maxDelay: TimeInterval = 10
 let delayPresets: [TimeInterval] = [0, 0.3, 0.5, 1, 2, 3, 5]
 let mainWindowTitle = "카카오톡"
 let pollInterval: TimeInterval = 0.05
+let deleteQueue = DispatchQueue(label: "kakao-bomb.delete", qos: .userInteractive)
 let kakaoBundleID = "com.kakao.KakaoTalkMac"
 let everyoneMenuID = "deleteToAllMessage:"   // 카톡 컨텍스트 메뉴 항목 identifier
 let everyoneTitle = "모두에게서 삭제"
@@ -491,9 +492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func fire(app: AXUIElement, armed a: Armed, bubble: Bubble) {
-        armed.removeAll { $0 === a }
+        // 장전은 유지 (토글). 연달아 보내도 메뉴 조작이 겹치지 않게 삭제는 한 번에 하나씩.
         setFlash(a.window, "⏳")
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) {
+        deleteQueue.asyncAfter(deadline: .now() + delay) {
             let ok = deleteForEveryone(app: app, table: a.table, sent: bubble, window: a.window)
             DispatchQueue.main.async {
                 NSSound(named: ok ? "Pop" : "Basso")?.play()

@@ -1,5 +1,5 @@
 #!/bin/bash
-# kakao-bomb.app 빌드 (Apple Silicon + Intel 유니버설) → dist/kakao-bomb-<버전>.zip
+# kakao-bomb.app 빌드 (Apple Silicon + Intel 유니버설) → dist/kakao-bomb-<버전>-mac.zip
 # 사용: ./build.sh 1.0.0
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -43,5 +43,5 @@ PLIST
 codesign --force --deep --sign - "$APP"
 codesign --verify --strict "$APP"
 
-ditto -c -k --keepParent "$APP" "dist/kakao-bomb-$VERSION.zip"
-echo "완료: dist/kakao-bomb-$VERSION.zip"
+ditto -c -k --keepParent "$APP" "dist/kakao-bomb-$VERSION-mac.zip"
+echo "완료: dist/kakao-bomb-$VERSION-mac.zip"

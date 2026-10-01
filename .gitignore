@@ -1,5 +1,7 @@
 kakao-bomb
 build/
 dist/
+windows/build/
+windows/dist/
 *.log
 .DS_Store

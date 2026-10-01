@@ -7,9 +7,18 @@
 - 삭제 지연: 트레이 −/+ (0.1초 단위, 0~10초) 또는 메뉴바 💣 > 삭제 지연. 재실행해도 유지
 - 갠톡/단톡 모두 동작 확인 (텍스트 메시지 기준)
 
-## 설치 (코딩 몰라도 됨)
+## 다운로드
 
-1. [Releases](../../releases/latest)에서 `kakao-bomb-x.y.z.zip` 다운로드 → 더블클릭으로 압축 풀기
+[최신 릴리즈](../../releases/latest)에서 내 컴퓨터에 맞는 파일 하나만 받으면 됨.
+
+| 컴퓨터 | 파일 |
+|---|---|
+| Mac (macOS 13 이상, M칩/Intel 모두) | `kakao-bomb-x.y.z-mac.zip` |
+| Windows 10/11 | `kakao-bomb-x.y.z-windows.exe` |
+
+## 설치 — Mac (코딩 몰라도 됨)
+
+1. `kakao-bomb-x.y.z-mac.zip` 다운로드 → 더블클릭으로 압축 풀기
 2. `kakao-bomb.app`을 **응용 프로그램** 폴더로 드래그
 3. 앱 실행 → "악성 코드가 없음을 확인할 수 없습니다" 창이 뜨면 **완료**
    → **시스템 설정 > 개인정보 보호 및 보안** 맨 아래 **"그래도 열기"** → 다시 실행 (처음 한 번만)
@@ -24,7 +33,7 @@
 ## 빌드 (개발자용)
 
 ```sh
-./build.sh 1.0.0        # → dist/kakao-bomb.app, dist/kakao-bomb-1.0.0.zip (유니버설, ad-hoc 서명)
+./build.sh 1.0.2        # → dist/kakao-bomb.app, dist/kakao-bomb-1.0.2-mac.zip (유니버설, ad-hoc 서명)
 
 # 개발 중엔 바이너리만
 swiftc -O -swift-version 5 main.swift -o kakao-bomb
@@ -63,8 +72,8 @@ swiftc -O -swift-version 5 main.swift -o kakao-bomb
 
 ### 설치
 
-1. [Releases](../../releases)에서 `kakao-bomb.exe` 다운로드 (파일 하나, 설치/압축 없음)
-2. `kakao-bomb.exe` 실행 → "Windows의 PC 보호" 창이 뜨면 **추가 정보 > 실행** (서명이 없어서 처음 한 번)
+1. [최신 릴리즈](../../releases/latest)에서 `kakao-bomb-x.y.z-windows.exe` 다운로드 (파일 하나, 설치/압축 없음). 원하는 폴더에 두기
+2. 실행 → "Windows의 PC 보호" 창이 뜨면 **추가 정보 > 실행** (서명이 없어서 처음 한 번)
 3. 알림 영역(시계 옆, 안 보이면 `^` 안쪽)에 폭탄 아이콘이 뜸. 카톡 채팅창을 열면 창 위에 `[💣 자폭] [−] 0.5초 [+]` 가 붙음
 4. 💣 자폭 또는 **Ctrl+Alt+D** → 그 채팅창 장전/해제. 아이콘 우클릭 > 삭제 지연 / 로그인 시 자동 실행 / 종료
 
@@ -76,12 +85,14 @@ Windows에 기본 내장된 .NET Framework 컴파일러를 쓰므로 SDK 설치 
 
 ```powershell
 cd windows
-powershell -ExecutionPolicy Bypass -File build.ps1 1.0.0   # → dist\kakao-bomb.exe (이 파일 하나가 배포물)
+powershell -ExecutionPolicy Bypass -File build.ps1 1.0.2   # → dist\kakao-bomb.exe (이 파일 하나가 배포물)
 
 dist\kakao-bomb.exe --debug     # 삭제 과정 로그 → %LOCALAPPDATA%\kakao-bomb\debug.log
 dist\kakao-bomb.exe --dump      # 삭제 없이 카톡 창 구조만 → dump.txt
 dist\kakao-bomb.exe --menushot  # 삭제 없이 메뉴/하위 메뉴만 열어 menu0.png, menu1.png 로 저장하고 닫음
 ```
+
+macOS에서 빌드할 때는 `windows/build.sh 1.0.2` (`brew install mono` 필요, .NET Framework 4.8 레퍼런스 어셈블리는 NuGet에서 자동으로 받음). 결과물은 build.ps1과 같은 참조/형식의 exe.
 
 ### 동작 원리 (macOS 판과 다른 점)
 

@@ -1,6 +1,6 @@
 # kakao-bomb 💣
 
-카카오톡(macOS)에서 장전해 두면 **해제할 때까지 보내는 내 메시지를 전부 N초 뒤 자동으로 "모두에게서 삭제"** 해주는 메뉴바 앱.
+카카오톡(macOS / [Windows](#windows-판-windows))에서 장전해 두면 **해제할 때까지 보내는 내 메시지를 전부 N초 뒤 자동으로 "모두에게서 삭제"** 해주는 메뉴바 앱.
 
 - 채팅창이 앞에 오면 창 옆에 트레이 `[💣 자폭] [−] 0.5초 [+]` 가 자동으로 붙음
 - 💣 자폭 또는 **⌃⌥D** → 그 채팅창 장전/해제 토글 (🔥). 다시 누를 때까지 유지
@@ -57,14 +57,54 @@ swiftc -O -swift-version 5 main.swift -o kakao-bomb
 - 컨텍스트 메뉴에 "삭제" 하위 메뉴 같은 건 없음. "모두에게서 삭제"가 바로 있음
 - 마우스 우클릭 방식은 좌표/타이밍 변수가 많아서 버림
 
-## Windows 포팅 노트
+## Windows 판 (`windows/`)
 
-Windows 카톡은 완전히 다른 프로그램(Win32)이라 이 코드는 그대로 못 씀. 로직(4~5번 + 삽질 기록)만 가져가면 됨. **아래는 검증 안 된 출발점.**
+카톡 PC 26.8.1, Windows 11, 배율 200%에서 동작 확인 (텍스트 메시지 기준).
 
-- 먼저 [Accessibility Insights](https://accessibilityinsights.io/) 나 `inspect.exe`(Windows SDK)로 카톡 채팅창 구조부터 볼 것
-  - 메시지 목록이 UI Automation에 행/텍스트로 노출되는지가 관건. 커스텀 컨트롤이라 안 보일 수 있음
-  - 입력창은 보통 `RICHEDIT50W` 클래스
-- 메시지 목록이 UIA로 안 읽히면 전송 감지는 입력창 기준으로: 장전 상태에서 입력창 텍스트가 비어 있지 않다가 Enter 후 비워지면 "보냄"
-- 삭제: 마지막 내 말풍선 컨텍스트 메뉴 → "모두에게서 삭제". 메뉴가 표준 Win32 팝업(`#32768`)이면 UIA `MenuItem`으로 이름 찾아 `Invoke` 가능
-- 언어 후보: Python + `pywinauto`/`uiautomation` (+ PyInstaller로 exe), 또는 C# + `System.Windows.Automation`
-- 트레이 UI: 채팅창 위치 따라다니는 작은 topmost 창 (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`로 포커스 안 뺏게)
+### 설치
+
+1. [Releases](../../releases)에서 `kakao-bomb-win-x.y.z.zip` 다운로드 → 압축 풀기
+2. `kakao-bomb.exe` 실행 → "Windows의 PC 보호" 창이 뜨면 **추가 정보 > 실행** (서명이 없어서 처음 한 번)
+3. 알림 영역(시계 옆, 안 보이면 `^` 안쪽)에 폭탄 아이콘이 뜸. 카톡 채팅창을 열면 창 위에 `[💣 자폭] [−] 0.5초 [+]` 가 붙음
+4. 💣 자폭 또는 **Ctrl+Alt+D** → 그 채팅창 장전/해제. 아이콘 우클릭 > 삭제 지연 / 로그인 시 자동 실행 / 종료
+
+설치할 것 없음 (Windows 10/11 기본 내장 .NET Framework 4.8 사용).
+
+### 빌드
+
+Windows에 기본 내장된 .NET Framework 컴파일러를 쓰므로 SDK 설치 불필요. 소스는 [windows/KakaoBomb.cs](windows/KakaoBomb.cs) 한 파일.
+
+```powershell
+cd windows
+powershell -ExecutionPolicy Bypass -File build.ps1 1.0.0   # → dist\kakao-bomb.exe, dist\kakao-bomb-win-1.0.0.zip
+
+dist\kakao-bomb.exe --debug     # 삭제 과정 로그 → %LOCALAPPDATA%\kakao-bomb\debug.log
+dist\kakao-bomb.exe --dump      # 삭제 없이 카톡 창 구조만 → dump.txt
+dist\kakao-bomb.exe --menushot  # 삭제 없이 메뉴/하위 메뉴만 열어 menu0.png, menu1.png 로 저장하고 닫음
+```
+
+### 동작 원리 (macOS 판과 다른 점)
+
+Windows 카톡은 메시지 목록(`EVA_VH_ListControl_Dblclk`)도 우클릭 메뉴(`EVA_Menu`)도 UI Automation에 내용이 안 나옴. 그래서 창 내용을 `PrintWindow`로 받아 픽셀로 위치를 찾고, **카톡 창에 메시지를 직접 보내서** 조작함. 실제 커서/키보드는 안 건드리고 채팅창이 다른 창에 가려져 있어도 됨.
+
+1. **채팅창 구분**: 카톡 프로세스의 최상위 창 중 `EVA_VH_ListControl*`(목록)과 `RICHEDIT50W`(입력창)를 둘 다 가진 창
+2. **전송 감지**: 입력창에 글이 있다가 Enter(또는 마우스 클릭) 직후 비워지면 "보냄". 50ms 폴링
+3. **말풍선 찾기**: 목록 맨 아래쪽에서 오른쪽 정렬(= 내 것)인 덩어리. 삭제 직전에 매번 새로 찾음
+4. **삭제**: 말풍선에 `WM_RBUTTONDOWN/UP` → 새로 뜬 `EVA_Menu`에 `↑` 키 메시지를 보내 하위 메뉴 화살표(`>`)가 있는 유일한 줄(= "삭제")까지 이동 → `→` 로 하위 메뉴 → 정확히 두 줄(모두에게서 삭제 / 나에게서만 삭제)이고 **첫 줄만 선택된 게 확인될 때에만** `Enter`
+   - 조건이 안 맞으면 아무것도 안 누르고 Esc 메시지로 닫음 → ❌ 실패
+   - 이 버전은 확인창 없이 바로 삭제됨
+
+### 삽질 기록
+
+- **빈 입력창은 비어 있지 않음.** 안내 문구 "메시지 입력"이 실제 텍스트로 들어 있음 → 그것도 빈 것으로 쳐야 전송이 감지됨
+- **메뉴에 마우스 메시지를 보내면 안 됨.** 카톡 메뉴는 실제 커서 위치를 따라가서, 메시지로 "삭제"에 올려 하위 메뉴를 열어도 곧바로 닫힘 (카톡이 뒤에 있을 땐 되고 앞에 있을 땐 안 되는 식으로 들쭉날쭉). 키 메시지는 안정적
+- `→` 로 하위 메뉴를 열면 첫 줄이 선택된 채로 열림. 하위 메뉴 자체는 마우스 메시지를 안 받음
+- 메뉴가 뜰 때 그림자 창(`SysShadow`)도 같이 새로 뜸 → 클래스 이름으로 걸러야 함
+- 고정 대기(sleep) 대신 "그려질 때까지 10ms 간격 확인"으로 바꾸니 메뉴 조작이 0.7초 → 0.25초
+
+### 한계
+
+- 픽셀 방식이라 테마/배율/카톡 버전에 따라 어긋날 수 있음. 카톡 업데이트로 메뉴 구성이 바뀌면 `--menushot`으로 확인
+- 메뉴가 잠깐 화면에 보였다 사라짐 (마우스 커서 위치에 뜸). 그 순간 마우스를 움직이면 실패할 수 있음
+- 채팅창이 최소화돼 있으면 안 됨. 사진·이모티콘·파일 전송은 감지 안 됨
+- 카톡을 관리자 권한으로 실행했다면 kakao-bomb도 관리자 권한이어야 함

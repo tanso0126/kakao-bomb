@@ -63,7 +63,7 @@ swiftc -O -swift-version 5 main.swift -o kakao-bomb
 
 ### 설치
 
-1. [Releases](../../releases)에서 `kakao-bomb-win-x.y.z.zip` 다운로드 → 압축 풀기
+1. [Releases](../../releases)에서 `kakao-bomb.exe` 다운로드 (파일 하나, 설치/압축 없음)
 2. `kakao-bomb.exe` 실행 → "Windows의 PC 보호" 창이 뜨면 **추가 정보 > 실행** (서명이 없어서 처음 한 번)
 3. 알림 영역(시계 옆, 안 보이면 `^` 안쪽)에 폭탄 아이콘이 뜸. 카톡 채팅창을 열면 창 위에 `[💣 자폭] [−] 0.5초 [+]` 가 붙음
 4. 💣 자폭 또는 **Ctrl+Alt+D** → 그 채팅창 장전/해제. 아이콘 우클릭 > 삭제 지연 / 로그인 시 자동 실행 / 종료
@@ -76,7 +76,7 @@ Windows에 기본 내장된 .NET Framework 컴파일러를 쓰므로 SDK 설치 
 
 ```powershell
 cd windows
-powershell -ExecutionPolicy Bypass -File build.ps1 1.0.0   # → dist\kakao-bomb.exe, dist\kakao-bomb-win-1.0.0.zip
+powershell -ExecutionPolicy Bypass -File build.ps1 1.0.0   # → dist\kakao-bomb.exe (이 파일 하나가 배포물)
 
 dist\kakao-bomb.exe --debug     # 삭제 과정 로그 → %LOCALAPPDATA%\kakao-bomb\debug.log
 dist\kakao-bomb.exe --dump      # 삭제 없이 카톡 창 구조만 → dump.txt

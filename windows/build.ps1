@@ -1,5 +1,5 @@
 # kakao-bomb.exe build (Windows built-in .NET Framework compiler, no SDK needed)
-#   -> dist\kakao-bomb.exe, dist\kakao-bomb-win-<version>.zip
+#   -> dist\kakao-bomb.exe (single file, this is the release asset)
 # usage: powershell -ExecutionPolicy Bypass -File build.ps1 1.0.0
 param([string]$Version = "1.0.0")
 $ErrorActionPreference = "Stop"
@@ -27,5 +27,4 @@ using System.Reflection;
     KakaoBomb.cs build\AssemblyInfo.cs
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-Compress-Archive -Force -Path dist\kakao-bomb.exe -DestinationPath "dist\kakao-bomb-win-$Version.zip"
-Write-Host "done: dist\kakao-bomb-win-$Version.zip"
+Write-Host "done: dist\kakao-bomb.exe ($Version)"
